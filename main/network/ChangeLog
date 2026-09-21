@@ -1,4 +1,6 @@
 HEAD
+	+ Regenerate the multi-WAN routing when a static interface comes back up, so a reconnected static WAN recovers its policy table and the failover checker can re-enable its gateway
+	+ Do not regenerate the gateways from interface events (DHCP lease, PPP or static link up) while there are pending changes, so unsaved edits are not silently committed
 	+ Remove DHCP-installed default routes from the main routing table so fwmark policy routing is not short-circuited (multi-WAN DHCP fix)
 	+ Stop deleting auto gateway rows when their interface is still DHCP/PPP but the lease is temporarily gone, so enable/disable and weight/default settings persist across saves
 8.1.0

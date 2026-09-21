@@ -5311,6 +5311,36 @@ sub regenGateways
     EBox::Util::Lock::unlock('network');
 }
 
+# Method: regenGatewaysOnEvent
+#
+#   Regenerate the default route table in response to an interface event, such
+#   as a DHCP lease being acquired or renewed, a PPP interface coming up or a
+#   static interface coming back up.
+#
+#   Unlike a plain regenGateways() call, this is a no-op when the network
+#   module has pending changes: regenGateways() commits the configuration and
+#   clears the unsaved-changes flag, so running it here would silently apply
+#   the user's edits. Saving regenerates the routing anyway, so skipping is
+#   safe. It is also a no-op while a save is in progress (the 'ifup' lock),
+#   because the routing is regenerated as part of it and nesting locks is
+#   avoided.
+#
+#   Callers which change the gateway configuration themselves (such as the WAN
+#   failover checker) must call regenGateways() directly, as they do need the
+#   configuration to be committed.
+#
+sub regenGatewaysOnEvent
+{
+    my ($self) = @_;
+
+    return if EBox::Global->getInstance()->modIsChanged('network');
+
+    my $ifupLock = EBox::Util::Lock::_lockFile('ifup');
+    return if (-f $ifupLock);
+
+    $self->regenGateways();
+}
+
 # Method: replicationExcludeKeys
 #
 #      Exclude these keys from replication.
