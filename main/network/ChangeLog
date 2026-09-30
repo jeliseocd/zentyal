@@ -1,4 +1,14 @@
 HEAD
+	+ Store the fwmark of each gateway in its own row and assign it only once, so the marks do not change when the gateways are added, removed or reordered and the installed policy routing rules stay valid
+	+ Watch kernel link state changes with a network link monitor service, only run while WAN failover is configured, and regenerate the multi-WAN routing on them, so bonds and bridges (whose carrier changes NetworkManager does not report) recover as soon as their link is back instead of waiting for the next failover check
+	+ Wait for the addresses of the interfaces used by gateways before regenerating the routing after a save, so no gateway is left without its policy table or out of the multipath default route while its DHCP lease is being re-acquired
+	+ Skip gateways that are not inside the network of their interface when installing the multipath default route, so a stale DHCP gateway does not make the whole default route installation fail and leave the system without a default route
+	+ Only enable back the gateways disabled by the failover checker itself, so a gateway disabled by the user stays disabled
+	+ Retry the routing regeneration from the link monitor until the interfaces used by gateways are up, so bonds and bridges recover after their carrier stabilization (e.g. the bridge STP forward delay)
+	+ Tolerate individual failures when installing the multi-WAN policy rules, so a failing rule does not abort the batch after the flush and leave the rest of the routing uninstalled
+	+ Do not run the WAN failover checks while the network module is being configured, so the tests do not see the routing mid-application and disable gateways that are actually fine
+	+ Make the WAN failover checker verify that the marked probes leave through the gateway interface, so a WAN whose link is down or whose policy route is missing is not reported as healthy
+	+ Regenerate the multi-WAN routing from the WAN failover checker when an up interface has no policy route, so a gateway disabled while its link was down is re-enabled without restarting the network module
 	+ Regenerate the multi-WAN routing when a static interface comes back up, so a reconnected static WAN recovers its policy table and the failover checker can re-enable its gateway
 	+ Do not regenerate the gateways from interface events (DHCP lease, PPP or static link up) while there are pending changes, so unsaved edits are not silently committed
 	+ Remove DHCP-installed default routes from the main routing table so fwmark policy routing is not short-circuited (multi-WAN DHCP fix)

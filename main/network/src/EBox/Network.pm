@@ -255,6 +255,18 @@ sub _systemdResolvedPreCondition
     return 1;
 }
 
+#  Method: _failoverPreCondition
+#
+#   The WAN failover link monitor is only needed when there are enabled WAN
+#   failover rules
+#
+sub _failoverPreCondition
+{
+    my ($self) = @_;
+
+    return $self->_failoverEnabled();
+}
+
 #  Method: _daemons
 #
 #   Overrides <EBox::Module::Service::_daemons>
@@ -263,7 +275,9 @@ sub _daemons
 {
     return [
         { name => 'NetworkManager'},
-        { name => 'systemd-resolved', precondition => \&_systemdResolvedPreCondition}
+        { name => 'systemd-resolved', precondition => \&_systemdResolvedPreCondition},
+        { name => 'zentyal.network-link-monitor.service', type => 'systemd',
+          precondition => \&_failoverPreCondition },
     ];
 }
 
@@ -3981,12 +3995,16 @@ sub _multigwRoutes
 
         # Write mark rules first to avoid local output problems
         push(@cmds, "/sbin/ip route flush table $table || true");
-        push(@markRules, "/sbin/ip rule add fwmark $mark/0xFF table $table");
-        push(@addrRules, "/sbin/ip rule add from $ip table $table");
+        # The rules are added after flush-fwmarks has removed all of them, so
+        # a failure in a single rule (e.g. a duplicated one) must not abort
+        # the batch and leave the rest uninstalled: the WAN failover checker
+        # verifies the rules and regenerates them if any is missing
+        push(@markRules, "/sbin/ip rule add fwmark $mark/0xFF table $table || true");
+        push(@addrRules, "/sbin/ip rule add from $ip table $table || true");
 
         # Add rule by source in multi interface configuration
         if (scalar keys %interfaces > 1) {
-            push(@addrRules, "/sbin/ip rule add from $address table $table");
+            push(@addrRules, "/sbin/ip rule add from $address table $table || true");
         }
 
         # '|| true' as a safety net: if the link drops between the check above
@@ -3995,7 +4013,7 @@ sub _multigwRoutes
     }
 
     push(@cmds, @addrRules, @markRules);
-    push(@cmds,'/sbin/ip rule add table main');
+    push(@cmds,'/sbin/ip rule add table main || true');
 
     # Not in @cmds array because of possible CONNMARK exception
     my @fcmds;
@@ -4307,7 +4325,6 @@ sub _enforceServiceState
     $self->_disableReversePath();
 
     $self->_applyChangesToSystemNetwork();
-    $self->_multigwRoutes($dynIfaces);
 
     $self->SUPER::_enforceServiceState();
     
@@ -4318,6 +4335,16 @@ sub _enforceServiceState
     
     # Clean up orphaned static route keys
     $self->_removeOrphanedStaticRoutes();
+
+    # 'netplan apply' above resets the DHCP leases and their addresses are
+    # re-acquired asynchronously. Regenerating before they are back would
+    # leave those gateways without policy routes and out of the multipath
+    # default, and the DHCP events cannot fix it because they are ignored
+    # while the module is being saved: wait (bounded) for them here. A lease
+    # arriving later regenerates the routing from its own DHCP event.
+    $self->_waitForGatewayIfaces();
+
+    $self->_multigwRoutes($dynIfaces);
 
     # Set the multipath default route as the final step: 'netplan apply' above
     # resets routing, so this must run after _applyChangesToSystemNetwork.
@@ -4338,6 +4365,38 @@ sub _enforceServiceState
     # multi-WAN inert. Only done when there are configured gateways, so a
     # single DHCP WAN without gateways keeps its default route.
     $self->_removeMainDefaultRoutes() if @{$self->gateways()};
+}
+
+# Method: _waitForGatewayIfaces
+#
+#   Waits (bounded) for the interfaces used by gateways to have an address.
+#   'netplan apply' resets the DHCP leases and their addresses are re-acquired
+#   asynchronously; regenerating the routing before they are back would leave
+#   those gateways without policy routes and out of the multipath default.
+#
+sub _waitForGatewayIfaces
+{
+    my ($self) = @_;
+
+    # Read the gateways from the committed configuration so GatewayTable's
+    # dynamic rows are not synced (and marked as changed) in the middle of a
+    # save.
+    my $network = EBox::Global->getInstance(1)->modInstance('network');
+
+    my $timeout = 10;
+    while ($timeout > 0) {
+        my $pending = 0;
+        foreach my $gw (@{$network->model('GatewayTable')->allGateways()}) {
+            my $iface = $gw->{'interface'};
+            next unless $network->_gatewayIfaceUp($iface);
+            next if $network->ifaceAddress($iface);
+            $pending = 1;
+            last;
+        }
+        last unless $pending;
+        sleep 1;
+        $timeout--;
+    }
 }
 
 sub _disableNetworkManagerUnsetIfaces
@@ -4809,6 +4868,68 @@ sub storeSelectedDefaultGateway
 {
     my ($self, $gateway) = @_;
     return $self->set('default/gateway', $gateway);
+}
+
+# Method: failoverDisabledGateway
+#
+#   Returns whether the given gateway was disabled by the WAN failover
+#
+# Parameters:
+#
+#   gateway - gateway id
+#
+sub failoverDisabledGateway
+{
+    my ($self, $gateway) = @_;
+
+    return $self->get("failover/disabled/$gateway");
+}
+
+# Method: failoverDisabledInitialized
+#
+#   Returns whether the failover disabled flags have been initialized. Older
+#   versions did not keep track of the gateways they disabled, so the first
+#   time the failover runs after an upgrade the disabled gateways are assumed
+#   to be disabled by it (they were, as older versions always enabled back
+#   the gateways passing their tests).
+#
+sub failoverDisabledInitialized
+{
+    my ($self) = @_;
+
+    return $self->get('failover/disabled_initialized');
+}
+
+# Method: setFailoverDisabledInitialized
+#
+#   Marks the failover disabled flags as initialized
+#
+sub setFailoverDisabledInitialized
+{
+    my ($self) = @_;
+
+    $self->_set('failover/disabled_initialized', 1);
+}
+
+# Method: setFailoverDisabledGateway
+#
+#   Stores whether the given gateway has been disabled by the WAN failover.
+#   This lets the failover checker enable back only the gateways it disabled
+#   itself, so a gateway disabled by the user is never enabled back. A key
+#   per gateway is used (instead of the module state) so concurrent state
+#   writers, like the DHCP dispatcher scripts, cannot lose the flag.
+#
+# Parameters:
+#
+#   gateway - gateway id
+#   disabled - boolean
+#
+sub setFailoverDisabledGateway
+{
+    my ($self, $gateway, $disabled) = @_;
+
+    # _set is used so this bookkeeping does not mark the module as changed
+    $self->_set("failover/disabled/$gateway", ($disabled ? 1 : ''));
 }
 
 # Method: DHCPGateway
@@ -5469,6 +5590,21 @@ sub _multipathCommand
         # would leave the default table without a route (no internet even via
         # the WAN that is still up).
         next unless $self->_gatewayIfaceUp($iface);
+
+        # Skip gateways that are not inside the network of their interface
+        # (e.g. a stale DHCP gateway left in the auto row while the lease has
+        # already moved to another network): the kernel rejects such a nexthop
+        # and the whole multipath command would fail.
+        unless ($method eq 'ppp') {
+            my $address = $self->ifaceAddress($iface);
+            my $netmask = $self->ifaceNetmask($iface);
+            if ($address and $netmask and
+                not isIPInNetwork($address, $netmask, "$ip/32")) {
+                EBox::warn("Gateway $ip is not in the network of interface " .
+                           "$iface. Not adding it to the default route.");
+                next;
+            }
+        }
 
         my $route = "via $ip dev $iface";
         if ($method eq 'ppp') {

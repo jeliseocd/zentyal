@@ -23,6 +23,7 @@ package EBox::Network::Test;
 use base 'Test::Class';
 
 use EBox::Test::RedisMock;
+use EBox::Network::Model::GatewayTable;
 
 use Test::Exception;
 use Test::More;
@@ -53,6 +54,69 @@ sub test_flag_if_up : Test(8)
     is_deeply($mod->flagIfUp(), ['eth0'], 'Flag is set correctly');
     lives_ok { $mod->unsetFlagIfUp() } 'No problem at deleting the flag';
     is($mod->flagIfUp(), undef, 'Flag has been unset correctly');
+}
+
+sub test_failover_disabled_flag : Test(9)
+{
+    my ($self) = @_;
+
+    my $mod = $self->{mod};
+
+    is($mod->failoverDisabledGateway('gtw1'), undef, 'No flag at init');
+    is($mod->failoverDisabledInitialized(), undef, 'Flags not initialized at init');
+    lives_ok { $mod->setFailoverDisabledGateway('gtw1', 1) } 'Marking a gateway as failover disabled lives';
+    is($mod->failoverDisabledGateway('gtw1'), 1, 'Gateway marked as failover disabled');
+    is($mod->failoverDisabledGateway('gtw2'), undef, 'Other gateways are not marked');
+    lives_ok { $mod->setFailoverDisabledInitialized() } 'Marking the flags as initialized lives';
+    is($mod->failoverDisabledInitialized(), 1, 'Flags marked as initialized');
+    lives_ok { $mod->setFailoverDisabledGateway('gtw1', 0) } 'Clearing the flag lives';
+    ok(! $mod->failoverDisabledGateway('gtw1'), 'Flag has been cleared correctly');
+}
+
+sub test_gateway_marks : Test(8)
+{
+    my ($self) = @_;
+
+    # stored marks are kept, even if the table order changes
+    my $marks = EBox::Network::Model::GatewayTable::_marksForIds(
+        { gtw26 => 1, gtw27 => 2, gtw30 => 3 },
+        [qw(gtw30 gtw26 gtw27)]);
+    is_deeply($marks, { gtw30 => 3, gtw26 => 1, gtw27 => 2 },
+              'Stored marks do not change with the table order');
+
+    # new gateways get the lowest free mark
+    $marks = EBox::Network::Model::GatewayTable::_marksForIds(
+        { gtw26 => 1, gtw27 => 2, gtw30 => 3 },
+        [qw(gtw26 gtw27 gtw30 gtw31)]);
+    is($marks->{gtw31}, 4, 'New gateway gets the next free mark');
+
+    # marks of removed gateways are reused
+    $marks = EBox::Network::Model::GatewayTable::_marksForIds(
+        { gtw26 => 1, gtw30 => 3 },
+        [qw(gtw26 gtw30 gtw31)]);
+    is($marks->{gtw31}, 2, 'Freed marks are reused');
+
+    # gateways without a stored mark (upgrade) get the lowest free marks
+    $marks = EBox::Network::Model::GatewayTable::_marksForIds(
+        {}, [qw(gtw26 gtw27)]);
+    is_deeply($marks, { gtw26 => 1, gtw27 => 2 },
+              'Gateways without a stored mark get the lowest free marks');
+
+    # duplicated or out of range stored marks are reassigned
+    $marks = EBox::Network::Model::GatewayTable::_marksForIds(
+        { gtw26 => 2, gtw27 => 2, gtw30 => 300 },
+        [qw(gtw26 gtw27 gtw30)]);
+    is_deeply($marks, { gtw26 => 2, gtw27 => 1, gtw30 => 3 },
+              'Duplicated and out of range marks are reassigned');
+
+    is(EBox::Network::Model::GatewayTable::_lowestFreeMark({}), 1,
+       'The lowest free mark is 1');
+    is(EBox::Network::Model::GatewayTable::_lowestFreeMark({ 1 => 1, 2 => 1 }), 3,
+       'The lowest free mark skips the used ones');
+    my %allUsed = map { $_ => 1 } (1 .. 0xFF);
+    throws_ok { EBox::Network::Model::GatewayTable::_lowestFreeMark(\%allUsed) }
+        'EBox::Exceptions::External',
+        'An error is thrown when there are no free marks';
 }
 
 1;

@@ -19,13 +19,17 @@ use warnings;
 
 use EBox;
 use EBox::Network;
+use EBox::NetWrappers;
 use EBox::Event;
 use EBox::Global;
 use EBox::Gettext;
+use EBox::Sudo;
+use EBox::Util::Lock;
 use EBox::Validate;
 use EBox::Exceptions::Lock;
 
 use TryCatch;
+use Socket qw(inet_ntoa);
 
 use constant PING_PATTERN => '7a6661696c6f76657274657374';
 use constant PING_PATTERN_TEXT => 'zfailovertest';
@@ -37,6 +41,15 @@ my $options = $network->model('WANFailoverOptions')->row();
 
 EBox::debug('Starting failover check...');
 
+# The network module regenerates the routing itself while it is being
+# configured (a save, a restart or its boot setup holds its lock): skip the
+# check in that case, the tests would see the routing mid-application and
+# disable gateways that are actually fine.
+if (EBox::Util::Lock::isLocked('network')) {
+    EBox::debug('The network module is being configured: skipping the failover check');
+    exit 0;
+}
+
 # Getting readonly instance to test the gateways
 my $global = EBox::Global->getInstance(1);
 my $network = $global->modInstance('network');
@@ -45,6 +58,7 @@ my $rules = $network->model('WANFailoverRules');
 my $gateways = $network->model('GatewayTable');
 my $marks = $network->marksForRouters();
 my $failed = {};
+my $needRegen = 0;
 
 my @enabledRules = @{$rules->enabledRows()};
 
@@ -66,15 +80,25 @@ unless ($readonly) {
 EBox::debug('Applying changes in the gateways table...');
 
 my $needSave = 0;
+# Older versions did not keep track of the gateways they disabled, so the
+# first time this checker runs the disabled gateways are assumed to be
+# disabled by the failover (see EBox::Network::failoverDisabledInitialized)
+my $flagsInitialized = $network->failoverDisabledInitialized();
 foreach my $id (@{$gateways->ids()}) {
     my $row = $gateways->row($id);
     my $gwName = $row->valueByName('name');
     my $enabled = $row->valueByName('enabled');
 
-    # It must be enabled if all tests are passed
+    # The failover disables the gateways whose tests fail and enables them back
+    # when they pass again, but only the gateways it disabled itself: a gateway
+    # disabled by the user stays disabled.
     my $enable = $enabled;
     if (defined($failed->{$id})) {
-        $enable = not($failed->{$id})
+        if ($failed->{$id}) {
+            $enable = 0;
+        } elsif ($network->failoverDisabledGateway($id) or (not $flagsInitialized)) {
+            $enable = 1;
+        }
     };
 
     EBox::debug("Properties for gateway $gwName ($id): enabled=$enabled, enable=$enable");
@@ -84,12 +108,18 @@ foreach my $id (@{$gateways->ids()}) {
         unless ($readonly) {
             $row->elementByName('enabled')->setValue($enable);
             $row->store();
+            $network->setFailoverDisabledGateway($id, not $enable);
             $needSave = 1;
-        }
-        if ($enable) {
-            EBox::info("Gateway $gwName connected again.");
+            if ($enable) {
+                EBox::info("Gateway $gwName connected again.");
+            }
         }
     }
+}
+
+unless ($readonly) {
+    # From now on the disabled state of every gateway is tracked
+    $network->setFailoverDisabledInitialized();
 }
 
 if ($readonly) {
@@ -148,7 +178,7 @@ if ($setAsDefault) {
     $needSave = 1;
 }
 
-if ($needSave) {
+if ($needSave or ($needRegen and not $readonly)) {
     EBox::debug('Regenerating rules for the gateways');
     $network->regenGateways();
 
@@ -232,6 +262,18 @@ sub _testRule
         return unless $host;
     }
 
+    # Do not trust the ping if the marked probes would leave through another WAN
+    my ($routeProblem, $routeMissing) =
+        _probeRouteProblem($network->realIface($iface),
+                           $address, $marks->{$gw}, $host);
+    if ($routeProblem) {
+        EBox::debug("Cannot test gateway $gwName: $routeProblem. Failing test.");
+        _markAsFailed($gw, $gwName, $wasEnabled, $routeProblem);
+        # Restore the policy routing so the gateway can be tested again
+        $needRegen = 1 if $routeMissing;
+        return;
+    }
+
     my $probes = $row->valueByName('probes');
     my $ratio = $row->valueByName('ratio') / 100;
     my $neededSuccesses = $probes * $ratio;
@@ -263,16 +305,95 @@ sub _testRule
 
     my $failRatio = $fails / $usedProbes;
     if ($failRatio >= $maxFailRatio) {
-        $failed->{$gw} = 1;
-
-        # Only generate event if gateway was not already disabled
-        return unless ($wasEnabled);
-
-        my $failRatio = sprintf("%.2f", $failRatio*100);
+        my $printableRatio = sprintf("%.2f", $failRatio*100);
         my $maxRatio = $maxFailRatio * 100;
-        my $reason = "'$typeName' test to host '$host' has failed ${failRatio}%, max=${maxRatio}%.";
-        EBox::info("Gateway $gwName disconnected: $reason");
+        my $reason = "'$typeName' test to host '$host' has failed ${printableRatio}%, max=${maxRatio}%.";
+        _markAsFailed($gw, $gwName, $wasEnabled, $reason);
     }
+}
+
+# Method: _markAsFailed
+#
+#   Marks a gateway as failed and logs an event when it was previously enabled
+#
+# Parameters:
+#
+#   gw - gateway id
+#   gwName - gateway name
+#   wasEnabled - whether the gateway was enabled before the test
+#   reason - string describing why the gateway is considered disconnected
+#
+sub _markAsFailed
+{
+    my ($gw, $gwName, $wasEnabled, $reason) = @_;
+
+    $failed->{$gw} = 1;
+
+    # Only generate event if gateway was not already disabled
+    return unless ($wasEnabled);
+
+    EBox::info("Gateway $gwName disconnected: $reason");
+}
+
+# Method: _probeRouteProblem
+#
+#   Returns the reason why the marked probes would not leave through the given
+#   interface (undef if they would) and whether the policy routing must be
+#   regenerated. The probes are marked to leave through the gateway's own
+#   policy table; if its route is missing they fall through to another WAN and
+#   the ping would wrongly succeed.
+#
+# Parameters:
+#
+#   iface - real interface name the probes must leave through
+#   address - source address used by the probes
+#   mark - fwmark assigned to the gateway
+#   host - probe destination (an IP address or a host name)
+#
+sub _probeRouteProblem
+{
+    my ($iface, $address, $mark, $host) = @_;
+
+    my $up = 0;
+    try {
+        $up = EBox::NetWrappers::iface_is_up($iface);
+    } catch {
+        $up = 0;
+    }
+    return ("interface $iface is down", 0) unless $up;
+
+    # The gateway's policy table must have its default route: if it is missing
+    # (e.g. the routing was regenerated while the interface was down), the
+    # marked traffic would silently fall through to the multipath default and
+    # the gateway marking would not be honored.
+    my $table = 100 + $mark;
+    my $tableRoutes = EBox::Sudo::rootWithoutException(
+        "/sbin/ip route show table $table 2>/dev/null || true");
+    unless (grep { /^\s*default\b/ } @{$tableRoutes}) {
+        return ("there is no policy route for the gateway in table $table", 1);
+    }
+
+    my $dst = $host;
+    unless (EBox::Validate::checkIP($dst)) {
+        # The host field is an IP address, but rules created by older
+        # versions may hold a host name: resolve it to check its route
+        my @resolved = gethostbyname($host);
+        return (undef, 0) unless @resolved;
+        $dst = inet_ntoa($resolved[4]);
+    }
+
+    my $output = EBox::Sudo::rootWithoutException(
+        "/sbin/ip route get $dst from $address mark $mark 2>/dev/null || true");
+    my $route = join(' ', @{$output});
+
+    unless ($route =~ /\bdev\s+(\S+)/) {
+        return ("there is no route for the marked probes through $iface", 1);
+    }
+    if ($1 ne $iface) {
+        return ("the marked probes would leave through $1 instead of $iface", 1);
+    }
+
+    return (undef, 0);
 }
 
 sub _runTest
