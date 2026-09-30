@@ -1,4 +1,5 @@
 HEAD
+	+ Move the WAN failover check logic into EBox::Network::FailoverChecker, run from the failover-checker script, so it can be unit tested, and make the message shown when the check is skipped for pending changes actionable
 	+ Store the fwmark of each gateway in its own row and assign it only once, so the marks do not change when the gateways are added, removed or reordered and the installed policy routing rules stay valid
 	+ Watch kernel link state changes with a network link monitor service, only run while WAN failover is configured, and regenerate the multi-WAN routing on them, so bonds and bridges (whose carrier changes NetworkManager does not report) recover as soon as their link is back instead of waiting for the next failover check
 	+ Wait for the addresses of the interfaces used by gateways before regenerating the routing after a save, so no gateway is left without its policy table or out of the multipath default route while its DHCP lease is being re-acquired

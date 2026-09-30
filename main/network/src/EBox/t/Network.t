@@ -24,6 +24,7 @@ use base 'Test::Class';
 
 use EBox::Test::RedisMock;
 use EBox::Network::Model::GatewayTable;
+use EBox::Network::FailoverChecker;
 
 use Test::Exception;
 use Test::More;
@@ -117,6 +118,37 @@ sub test_gateway_marks : Test(8)
     throws_ok { EBox::Network::Model::GatewayTable::_lowestFreeMark(\%allUsed) }
         'EBox::Exceptions::External',
         'An error is thrown when there are no free marks';
+}
+
+sub test_failover_decisions : Test(9)
+{
+    my ($self) = @_;
+
+    # gateway enablement
+    is(EBox::Network::FailoverChecker::gatewayEnablement(1, 1, 0, 1), 0,
+       'A gateway whose tests fail is disabled');
+    is(EBox::Network::FailoverChecker::gatewayEnablement(0, 0, 1, 1), 1,
+       'A recovered gateway disabled by the failover is enabled back');
+    is(EBox::Network::FailoverChecker::gatewayEnablement(0, 0, 0, 1), 0,
+       'A gateway disabled by the user stays disabled');
+    is(EBox::Network::FailoverChecker::gatewayEnablement(0, 0, 0, 0), 1,
+       'Disabled gateways are enabled back when the flags are not initialized');
+    is(EBox::Network::FailoverChecker::gatewayEnablement(1, undef, 0, 1), 1,
+       'A gateway without tests keeps its state');
+
+    # test failure ratio
+    ok(EBox::Network::FailoverChecker::testFailure(6, 6, 0.4),
+       'All probes failed');
+    ok(! EBox::Network::FailoverChecker::testFailure(1, 6, 0.4),
+       'One failure out of six is below the required ratio');
+
+    # route problems
+    my ($problem) = EBox::Network::FailoverChecker::routeProblem('eth0', 0, 101, [], '');
+    is($problem, 'interface eth0 is down',
+       'A down interface is a route problem');
+    ($problem) = EBox::Network::FailoverChecker::routeProblem('eth0', 1, 101, [], '');
+    is($problem, 'there is no policy route for the gateway in table 101',
+       'A missing policy route is a route problem');
 }
 
 1;
