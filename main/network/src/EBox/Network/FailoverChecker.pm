@@ -367,6 +367,17 @@ sub _testRule
     # If a test for this gw has already failed we don't test any other
     return if ($self->{failed}->{$gw});
 
+    # A gateway whose interface does not exist any more (e.g. a bond that was
+    # removed while a stale gateway row still points to it, which happens
+    # before GatewayTable::syncRows has deleted the row) cannot be tested:
+    # ifaceMethod would throw DataNotFound and abort the whole failover check,
+    # so the rest of the gateways would never be tested nor re-enabled.
+    unless ($network->ifaceExists($iface)) {
+        EBox::debug("Interface $iface of gateway $gwName does not exist. Skipping test.");
+        $self->_markAsFailed($gw, $gwName, $wasEnabled, "interface $iface does not exist");
+        return;
+    }
+
     my ($ppp_iface, $iface_up);
     if ($network->ifaceMethod($iface) eq 'ppp') {
         EBox::debug("It is a PPPoE gateway");

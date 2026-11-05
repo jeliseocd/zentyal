@@ -102,15 +102,23 @@ sub syncRows
     my %dynamicIfaces = map { $_ => 1 } (@{$network->dhcpIfaces()},
                                          @{$network->pppIfaces()});
 
-    my %currentIfaces = map {
-        my $rowId = $_;
+    # Keyed by interface: a manual gateway and an auto gateway may share the
+    # interface (e.g. a stale auto row and a manual one for the same bond), so
+    # the first row of each interface is kept. The auto row is preferred over
+    # the manual one, as it is the one which is synced and eventually removed
+    # when its interface disappears.
+    my %currentIfaces;
+    my %currentIfacesIsAuto;
+    foreach my $rowId (@{$currentRows}) {
         my $row = $self->row($rowId);
-        if ($row) {
-            ($row->valueByName('interface') => $rowId)
-        } else {
-            ()
-        }
-    } @{$currentRows};
+        next unless ($row);
+        my $iface = $row->valueByName('interface');
+        my $auto = $row->valueByName('auto');
+        next if ((exists $currentIfaces{$iface}) and
+                 not ($auto and not $currentIfacesIsAuto{$iface}));
+        $currentIfaces{$iface} = $rowId;
+        $currentIfacesIsAuto{$iface} = $auto;
+    }
 
     my $modified = 0;
 
@@ -169,11 +177,36 @@ sub syncRows
             # the user's enabled/default/weight settings and the row id are
             # preserved; the gateway IP will be refreshed by the modify path
             # above when the lease is re-acquired.
-            next;
+            #
+            # Unless the interface does not exist at all (neither in the
+            # system nor in the config, e.g. a bond removed while its row was
+            # still in the table): the row is stale and must be removed, as it
+            # would make the routing regeneration fail.
+            next if ($network->ifaceExists($iface));
         }
 
-        # The interface is no longer configured as DHCP/PPP — genuinely remove
-        # the auto gateway.
+        # The interface is no longer configured as DHCP/PPP, or it does not
+        # exist any more (e.g. a bond which was removed without deleting its
+        # gateway row, so the row points to a nonexistent interface): the auto
+        # gateway is stale and must be removed.
+        $self->removeRow($id, 1);
+
+        $modified = 1;
+    }
+
+    # A gateway (auto or manual) whose interface does not exist any more
+    # (neither in the system nor in the config, e.g. a bond which was removed
+    # while its gateway row was still in the table) is stale: keeping it would
+    # make the routing regeneration (and the save itself) work with a
+    # nonexistent interface, and the WAN failover would try to test it.
+    foreach my $iface (keys %currentIfaces) {
+        next if ($network->ifaceExists($iface));
+
+        my $id = $currentIfaces{$iface};
+        my $row = $self->row($id);
+        next unless ($row);
+
+        EBox::warn("Removing gateway $id: interface $iface does not exist");
         $self->removeRow($id, 1);
 
         $modified = 1;

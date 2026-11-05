@@ -25,9 +25,40 @@ use base 'Test::Class';
 use EBox::Test::RedisMock;
 use EBox::Network::Model::GatewayTable;
 use EBox::Network::FailoverChecker;
-
 use Test::Exception;
 use Test::More;
+
+# Only the NetWrappers stub is needed here, and it is faked in place: the
+# installed zentyal-core does not ship the Test::MockObject modules required
+# by the stub nor by EBox::TestStubs.
+no warnings 'once';
+if (! exists $INC{'Test/MockObject.pm'}) {
+    @Test::MockObject::ISA = qw(Exporter);
+    $INC{'Test/MockObject.pm'} = __FILE__;
+    *Test::MockObject::import = sub { 1 };
+    *Test::MockObject::fake_module = sub {
+        my ($class, $pkg, %subs) = @_;
+        for my $name (keys %subs) {
+            no strict 'refs';
+            *{"${pkg}::${name}"} = $subs{$name};
+        }
+    };
+}
+require EBox::NetWrappers::TestStub;
+
+sub activate_stubs : Test(startup)
+{
+    # Fake only the network system calls, with a single existing interface
+    # (eth0), so the existence guards can be tested. The whole EBox::TestStubs
+    # is not activated: faking Module::Config would hide the RedisMock storage
+    # used by the network module.
+    EBox::NetWrappers::TestStub::fake();
+    # eth99 is the only interface of the fake system, so it can be told
+    # apart from a nonexistent one
+    EBox::NetWrappers::TestStub::setFakeIfaces(
+        { eth99 => { up => 1,
+                       address => { '10.0.2.200' => '255.255.255.0' } } });
+}
 
 sub test_use_ok : Test(startup => 1)
 {
@@ -171,6 +202,105 @@ sub test_failover_decisions : Test(9)
     ($problem) = EBox::Network::FailoverChecker::routeProblem('eth0', 1, 101, [], '');
     is($problem, 'there is no policy route for the gateway in table 101',
        'A missing policy route is a route problem');
+}
+
+sub test_stale_gateway_iface : Test(4)
+{
+    my ($self) = @_;
+
+    my $mod = $self->{mod};
+
+    # Make the guards work on the interfaces of the fake system, not on the
+    # cached list of the real ones
+    EBox::NetWrappers::clean_ifaces_list_cache();
+
+    # Reproduction of the bonding regression: a gateway row survives with an
+    # interface which has just been removed (a bond unset while its gateway
+    # rows were still in the table). After 'netplan apply' the interface does
+    # not exist in the system nor in the config, so the existence guards must
+    # skip it instead of calling ifaceMethod/realIface (which throw
+    # DataNotFound and abort the save or the routing regeneration).
+
+    # An interface which only exists in the config is considered to exist even
+    # if the system has not created it yet (e.g. right before 'netplan apply')
+    $mod->set_hash('interfaces', { bond0 => { method => 'dhcp' } });
+    lives_ok { $mod->_disableReversePath([{ id => 'gtw41', interface => 'bond0',
+                                              ip => '192.168.56.1',
+                                              name => 'dhcp-gw-bond0',
+                                              enabled => 1 }]) }
+        'Disabling the reverse path skips a gateway with a nonexistent interface';
+    ok($mod->ifaceExists('bond0'),
+       'An interface present only in the config still exists');
+
+    # Once it is removed from the config too, it does not exist any more
+    $mod->set_hash('interfaces', {});
+    is($mod->ifaceExists('bond0'), undef,
+       'ifaceExists returns false for a nonexistent interface');
+}
+
+sub test_bridge_creation : Test(4)
+{
+    my ($self) = @_;
+
+    my $mod = $self->{mod};
+
+    # A newly created bridge must stay in the configuration after a save:
+    # _setConf drops the interfaces without a method, so the bridge needs one
+    # (it is an unmanaged virtual interface).
+    $mod->set_hash('interfaces', {
+        eth3 => { name => 'eth3', method => 'dhcp', external => 1 },
+    });
+
+    $mod->_createBridge(1);
+
+    my $ifaces = $mod->get_hash('interfaces');
+    ok(exists $ifaces->{br1}, 'The bridge entry is written to the configuration');
+    ok((defined $ifaces->{br1}->{method}) && (length $ifaces->{br1}->{method}),
+       'The bridge has a method, so _setConf does not consider it empty');
+    ok(!$mod->_isEmpty('br1'), 'The bridge is not considered empty');
+
+    # The unmanaged bridge must not be handled as a real WAN or LAN
+    my $external = $mod->ExternalIfaces();
+    ok((not grep { $_ eq 'br1' } @{$external}),
+       'An unmanaged bridge is not listed as an external interface');
+}
+
+sub test_empty_bond_removal : Test(3)
+{
+    my ($self) = @_;
+
+    my $mod = $self->{mod};
+
+    # A bond whose last slave has been moved elsewhere (e.g. bridged) keeps
+    # only its mode in the configuration: it must be removed, or it stays
+    # listed as an interface for ever.
+    $mod->set_hash('interfaces', {
+        eth2  => { name => 'eth2', method => 'dhcp' },
+        eth3  => { name => 'eth3', method => 'dhcp' },
+        bond0 => { bond_mode => 'balance-rr' },
+    });
+    $mod->_removeEmptyBonds();
+    my $ifaces = $mod->get_hash('interfaces');
+    ok((not exists $ifaces->{bond0}), 'A bond with no slaves is removed');
+
+    # A bond which still has a slave must NOT be removed
+    $mod->set_hash('interfaces', {
+        eth2  => { name => 'eth2', method => 'bundled', bond_id => 1 },
+        eth3  => { name => 'eth3', method => 'dhcp' },
+        bond1 => { bond_mode => 'balance-rr' },
+    });
+    $mod->_removeEmptyBonds();
+    $ifaces = $mod->get_hash('interfaces');
+    ok(exists $ifaces->{bond1}, 'A bond with a slave is kept');
+
+    # A bond which has its own method (configured) is kept, too
+    $mod->set_hash('interfaces', {
+        eth2  => { name => 'eth2', method => 'dhcp' },
+        bond2 => { method => 'dhcp', bond_mode => 'balance-rr' },
+    });
+    $mod->_removeEmptyBonds();
+    $ifaces = $mod->get_hash('interfaces');
+    ok(exists $ifaces->{'bond2'}, 'A configured bond is kept even with no slave');
 }
 
 1;

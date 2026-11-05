@@ -38,6 +38,20 @@ EBox::debug("Called dhcp-gateway.pl with the following values: iface '$iface' ro
 $iface or exit;
 $router or exit;
 
+# NetworkManager reports IP4_GATEWAY as 0.0.0.0 when the lease carries no
+# router (e.g. a DHCP server that does not advertise one, or a bond whose
+# slaves are on different subnets). That is not a gateway, so there is
+# nothing to store, but the routing must still be regenerated: a lease event
+# re-adds the DHCP default route to the main table and the multi-WAN routing
+# has to remove it again.
+if ($router eq '0.0.0.0') {
+    try {
+        $network->regenGatewaysOnEvent();
+    } catch {
+    }
+    exit;
+}
+
 try {
     $network->setDHCPGateway($iface, $router);
 

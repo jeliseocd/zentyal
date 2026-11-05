@@ -156,11 +156,17 @@ network:
 %       if($method eq 'dhcp') {
       dhcp4: yes
       dhcp6: no
-%       } else {
+%       } elsif ($method eq 'static') {
       dhcp4: no
       dhcp6: no
       addresses:
         - <% $networkMod->ifaceAddress($iface) %>/<% EBox::NetWrappers::bits_from_mask($networkMod->ifaceNetmask($iface)) %>
+%       } else {
+% # An unmanaged bridge ('bridge' method) has no address of its own: its
+% # members keep their configuration and the bridge only carries their
+% # traffic, so it is rendered without addresses.
+      dhcp4: no
+      dhcp6: no
 % # Gateway routes are intentionally NOT written to netplan: multi-WAN routing
 % # (per-gateway tables, ip rules and the multipath default) is managed entirely
 % # by EBox::Network::_multigwRoutes / _multipathCommand. Writing default routes

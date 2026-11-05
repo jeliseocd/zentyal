@@ -406,6 +406,7 @@ sub ExternalIfaces
         ($self->ifaceMethod($_) eq 'notset') and next;
         ($self->ifaceMethod($_) eq 'trunk') and next;
         ($self->ifaceMethod($_) eq 'bundled') and next;
+        ($self->ifaceMethod($_) eq 'bridge') and next;
         if ($self->ifaceIsExternal($_)) {
             push(@array, $_);
         }
@@ -455,6 +456,7 @@ sub InternalIfaces
         ($self->ifaceMethod($_) eq 'notset') and next;
         ($self->ifaceMethod($_) eq 'trunk') and next;
         ($self->ifaceMethod($_) eq 'bundled') and next;
+        ($self->ifaceMethod($_) eq 'bridge') and next;
         unless ($self->ifaceIsExternal($_)) {
             push(@array, $_);
         }
@@ -527,12 +529,21 @@ sub ifaceExists # (interface)
 {
     my ($self, $name) = @_;
     defined($name) or return undef;
-    if ($self->vifaceExists($name)) {
-        return 1;
-    }
-    if (iface_exists($name)) {
-        return 1;
-    }
+
+    # This method is the guard used before calling ifaceMethod/realIface on
+    # interfaces coming from other models (e.g. gateway rows pointing to a
+    # bond which has just been removed), so it must never throw: a virtual
+    # interface of a non-static interface raises an exception.
+    my $vifaceExists = 0;
+    try {
+        $vifaceExists = $self->vifaceExists($name);
+    } catch {
+        $vifaceExists = 0;
+    };
+    return 1 if ($vifaceExists);
+
+    return 1 if (iface_exists($name));
+
     my $ifaces = $self->ifaces;
     if (grep(/^$name$/, @{$ifaces})) {
         return 1;
@@ -2536,7 +2547,15 @@ sub _createBridge
                                            'value' => $id);
     }
 
-    $self->setIfaceAlias($bridge, $bridge);
+    # The bridge is a virtual interface, but it still needs a method: without
+    # it _isEmpty() considers the interface empty and _setConf() removes it
+    # before rendering netplan, so the bridge never reaches the system. An
+    # interface bridge is unmanaged (no addresses on it), the method is only
+    # the marker that keeps the entry alive; members keep their own method.
+    $interfaces->{$bridge} = { name   => $bridge,
+                               method => 'bridge',
+                               alias  => $bridge };
+    $self->set('interfaces', $interfaces);
 }
 
 # Method: _removeBridge
@@ -2788,11 +2807,30 @@ sub _removeEmptyBonds
     my $modified = 0;
     my $stateModified = 0;
     
+    # A bond whose only remaining content is its mode (all its slaves were
+    # moved elsewhere, e.g. the last one was bridged) has no reason to stay:
+    # it would keep showing up as an interface and as a stale entry in the
+    # configuration with no method and no slave.
+    my %slavesOf;
     for my $iface (keys %{$ifaces}) {
-        if ($iface =~ /^bond\d+$/ && keys %{$ifaces->{$iface}} == 0) {
-            delete $ifaces->{$iface};
-            $modified = 1;
-        }
+        my $bondId = $ifaces->{$iface}->{bond_id};
+        next unless (defined($bondId));
+        $slavesOf{$bondId}++;
+    }
+
+    for my $iface (keys %{$ifaces}) {
+        next unless ($iface =~ /^bond(\d+)$/);
+        my $bondId = $1;
+        # A configured bond (it has a method of its own) is kept even without
+        # slaves: the user may be in the middle of configuring it.
+        next if (defined($ifaces->{$iface}->{method}));
+        # A bond which still has slaves is alive, whatever else it contains.
+        next if ($slavesOf{$bondId});
+        # Otherwise the bond only holds leftovers (its mode and nothing else,
+        # typically because its last slave was moved elsewhere): remove it, as
+        # it would stay listed as an interface for ever.
+        delete $ifaces->{$iface};
+        $modified = 1;
     }
     
     for my $iface (keys %{$state->{interfaces}}) {
@@ -3933,6 +3971,13 @@ sub _disableReversePath # (routers?)
     my %seen;
     for my $router ( reverse @{$routers} ) {
         my $iface = $router->{'interface'};
+
+        # A gateway row may survive with an interface which has just been
+        # removed (e.g. a bond with a manual gateway row): after 'netplan
+        # apply' the interface no longer exists in the system nor in the
+        # config, and realIface would throw DataNotFound and abort the save.
+        next unless ($self->ifaceExists($iface));
+
         $iface = $self->realIface($iface);
         # remove viface portion
         $iface =~ s/:.*$//;
@@ -4027,6 +4072,18 @@ sub _multigwRoutes
         next unless $ip;
 
         my $iface = $router->{'interface'};
+
+        # Skip gateways whose interface does not exist any more (e.g. a bond
+        # removed by the user while a stale gateway row still points to it):
+        # ifaceMethod/realIface would throw DataNotFound and abort the whole
+        # routing regeneration.
+        unless ($self->ifaceExists($iface)) {
+            EBox::warn("Interface $iface used by gateway " .
+                            $router->{name} . " does not exist." .
+                        " Not adding multi-gateway rules for this gateway.");
+            next;
+        }
+
         my $method = $self->ifaceMethod($iface);
         $interfaces{$iface}++;
 
@@ -4123,6 +4180,10 @@ sub _multigwRoutes
 
         # Match interface instead of mac for pppoe and dhcp
         my $mac = $router->{'mac'};
+
+        # Stale gateway row whose interface was removed: nothing to mark
+        next unless ($self->ifaceExists($router->{'interface'}));
+
         my $iface = $self->realIface($router->{'interface'});
         my $origin;
         if ($mac) {
@@ -4967,6 +5028,27 @@ sub BundledCleanUp # (interface)
     }
 
     $self->_removeEmptyBonds();
+
+    # A bundled interface whose bond does not exist any more (e.g. the bond
+    # was removed while some of its slaves were still pointing to it) is an
+    # orphan: it would keep 'bundled' as its method, so it would be ignored
+    # when looking for gateways and its DHCP address would be lost. Reset
+    # those interfaces so they can be configured again.
+    my $bonds = $self->bonds();
+    my %existingBonds = map { $_ => 1 } @{$bonds};
+    my $orphaned = 0;
+    $ifaces = $self->get_hash('interfaces');
+    for my $if (keys %{$ifaces}) {
+        next unless ($self->ifaceMethod($if) eq 'bundled');
+        my $bondId = $ifaces->{$if}->{bond_id};
+        next unless (defined($bondId));
+        next if (exists $existingBonds{$bondId});
+        delete $ifaces->{$if};
+        $orphaned = 1;
+    }
+    if ($orphaned) {
+        $self->set('interfaces', $ifaces);
+    }
 }
 
 # Method: selectedDefaultGateway
@@ -5730,7 +5812,8 @@ sub _multipathCommand
             my $ip = $row->valueByName('ip');
             my $iface = $row->valueByName('interface');
             my $weight = $row->valueByName('weight');
-            push (@gateways, {ip => $ip, interface => $iface, weight => $weight});
+            push (@gateways, {ip => $ip, interface => $iface, weight => $weight,
+                              name => $row->valueByName('name')});
         } else {
             return undef;
         }
@@ -5750,6 +5833,19 @@ sub _multipathCommand
         next unless ($gw->{'balance'} or (@gateways == 1));
 
         my $iface = $gw->{'interface'};
+
+        # Skip gateways whose interface does not exist any more: ifaceMethod
+        # would throw DataNotFound, and this method must never die (it is
+        # called from regenGateways on DHCP events and from the WAN failover
+        # checker): a single stale row would leave the default table without
+        # the rest of the gateways, breaking the connectivity.
+        unless ($self->ifaceExists($iface)) {
+            EBox::warn("Interface $iface used by gateway " .
+                       $gw->{'name'} . " does not exist." .
+                       " Not adding it to the default route.");
+            next;
+        }
+
         my $method = $self->ifaceMethod($iface);
 
         $iface = $self->realIface($iface);
